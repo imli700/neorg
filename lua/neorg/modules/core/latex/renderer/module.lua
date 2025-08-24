@@ -1,4 +1,3 @@
--- Working version FINAL
 --[[
     file: Core-Latex-Renderer
     title: Rendering LaTeX with snacks.nvim
