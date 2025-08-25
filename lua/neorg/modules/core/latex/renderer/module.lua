@@ -1,4 +1,3 @@
--- 8/25/25
 --[[
     file: Core-Latex-Renderer
     title: Rendering LaTeX with snacks.nvim
@@ -38,10 +37,6 @@ module.config.public = {
     -- When true, images of rendered LaTeX will cover the source LaTeX they were produced from.
     conceal = true,
 
-    -- The rendering density for the LaTeX image, similar to DPI.
-    -- Higher values result in crisper images at the expense of performance.
-    density = 300,
-
     -- When true, images will render when a `.norg` buffer is entered.
     render_on_enter = false,
 
@@ -50,6 +45,9 @@ module.config.public = {
 
     -- Only render latex snippets that are longer than this many chars.
     min_length = 1,
+
+    font_size_inline = "\\normalsize", -- e.g., "\\large"
+    font_size_block = "\\Large", -- keep bigger for blocks if desired
 }
 
 ---Compute and set the foreground color hex string for LaTeX rendering.
@@ -66,30 +64,33 @@ local function compute_foreground()
     end
 end
 
----Creates a full LaTeX document source from a math snippet.
----@param snippet string The raw math snippet from the buffer.
----@param is_inline boolean Whether the math is inline or a block.
----@return string The full LaTeX source code.
 local function create_latex_source(snippet, is_inline)
     local fg_hex = module.private.foreground_hex
     local content = vim.trim(snippet or "")
 
+    local size_cmd = is_inline and (module.config.public.font_size_inline or "\\normalsize")
+        or (module.config.public.font_size_block or "\\Large")
+
     if is_inline then
         content = string.gsub(content, "^%$|", "")
         content = string.gsub(content, "|%$$", "")
+        -- Force display math style for clearer fractions
+        if not content:find("\\begin") then
+            content = "\\displaystyle " .. content
+        end
     end
 
-    local document_class = is_inline and "standalone" or "article"
     local template = [[
-        \documentclass[preview,border=2pt]{]] .. document_class .. [[}
-        \usepackage{amsmath, amssymb, amsfonts, amscd, mathtools, xcolor}
-        \pagestyle{empty}
-        \begin{document}
-        { \Large \selectfont
-          \color[HTML]{${color}}
-        ${content}}
-        \end{document}
-    ]]
+    \documentclass[preview,border=2pt]{%s}
+    \usepackage{amsmath, amssymb, amsfonts, amscd, mathtools, xcolor}
+    \pagestyle{empty}
+    \begin{document}
+    { %s \selectfont
+      \color[HTML]{${color}}
+    ${content}}
+    \end{document}
+  ]]
+    template = template:format(is_inline and "standalone" or "article", size_cmd)
 
     return template:gsub("${color}", fg_hex):gsub("${content}", content)
 end
@@ -102,15 +103,47 @@ module.load = function()
     end
     placement = snacks_placement
 
-    local snacks_image = require("snacks.image")
+    -- Monkey-patch to prevent inline math collapse
+    do
+        local Placement = placement
+        if not Placement._no_inline_collapse_for_math then
+            Placement._no_inline_collapse_for_math = true
+            local util = require("snacks.image.util")
+            local orig_state = Placement.state
+
+            function Placement:state()
+                local st = orig_state(self)
+                if self.opts and self.opts.inline and self.opts.type == "math" and st.loc.height == 1 then
+                    -- Recompute without the inline collapse
+                    local width, height = vim.o.columns, vim.o.lines
+                    for _, win in ipairs(self:wins()) do
+                        width = math.min(width, vim.api.nvim_win_get_width(win))
+                        height = math.min(height, vim.api.nvim_win_get_height(win))
+                    end
+                    local size = util.fit(self.img.file, { width = width, height = height }, { info = self.img.info })
+                    st.loc.width, st.loc.height = size.width, size.height
+                end
+                return st
+            end
+        end
+    end
+
+    -- Pick a moderate read density
+    local read_density = 144
     local magick_args = {
         "-density",
-        module.config.public.density,
-        "{src}[0]",
+        read_density,
+        "{src}",
         "-background",
         "none",
         "-trim",
+        "-set",
+        "units",
+        "PixelsPerInch",
+        "-density",
+        96,
     }
+    local snacks_image = require("snacks.image")
     snacks_image.config.convert.magick.pdf = magick_args
     snacks_image.config.convert.magick.math = magick_args
 
@@ -144,6 +177,18 @@ module.load = function()
             },
         })
     end)
+end
+
+-- compute per-window bounds (cells)
+local function window_bounds(inline)
+    local cols = vim.api.nvim_win_get_width(0)
+    local rows = vim.api.nvim_win_get_height(0)
+    -- tune these fractions to taste
+    if inline then
+        return math.floor(cols * 0.85), math.max(2, math.floor(rows * 0.18))
+    else
+        return math.floor(cols * 0.90), math.floor(rows * 0.35)
+    end
 end
 
 function module.private.update_placements(buf)
@@ -186,12 +231,16 @@ function module.private.update_placements(buf)
             local range = { node:range() }
             local pos = { range[1] + 1, range[2] }
 
+            local mw, mh = window_bounds(true)
             local new_placement = placement.new(buf, tex_file, {
                 pos = pos,
+                -- Corrected typo from user snippet: range[3] and range[4] instead of range + 1 and range
                 range = { range[1] + 1, range[2], range[3] + 1, range[4] },
                 inline = true,
                 conceal = module.config.public.conceal,
                 type = "math",
+                max_width = mw,
+                max_height = mh,
             })
 
             if new_placement then
@@ -201,7 +250,6 @@ function module.private.update_placements(buf)
         buf
     )
 
-    -- >>> START: YOUR INTEGRATED MANUAL PARSER FOR BLOCK MATH <<<
     -- Second, handle @math blocks by manually parsing lines for robustness.
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     local i = 1
@@ -230,7 +278,6 @@ function module.private.update_placements(buf)
                     active_nodes[block_id] = true
 
                     if not current_placements[block_id] then
-                        -- NOTE: Calling with `is_inline = false`
                         local tex_source = create_latex_source(snippet, false)
                         local source_hash = vim.fn.sha256(tex_source)
                         local tex_file = module.private.cache_dir .. source_hash:sub(1, 12) .. ".tex"
@@ -239,26 +286,17 @@ function module.private.update_placements(buf)
                             vim.fn.writefile(vim.split(tex_source, "\n"), tex_file)
                         end
 
-                        -- determine the indentation of the first content line (line after @math)
-                        local content_first_line_idx = start_line + 1
-                        local indent = 0
-                        if lines[content_first_line_idx] then
-                            local leading = lines[content_first_line_idx]:match("^(%s*)") or ""
-                            indent = #leading
-                        else
-                            -- fallback: indentation of the @math line itself or zero
-                            indent = #(lines[start_line]:match("^(%s*)") or "")
-                        end
+                        local full_range = { start_line + 1, 0, end_line + 1, #lines[end_line] }
 
-                        -- Range uses 1-indexed rows and 0-indexed columns (same convention as the rest of your code)
-                        local full_range = { start_line, indent, end_line, #lines[end_line] }
-
+                        local mw, mh = window_bounds(false)
                         local new_placement = placement.new(buf, tex_file, {
-                            pos = { full_range[1], full_range[2] }, -- start row, start col (0-index)
+                            pos = { full_range[1], full_range[2] },
                             range = full_range,
                             inline = true,
                             conceal = module.config.public.conceal,
                             type = "math",
+                            max_width = mw,
+                            max_height = mh,
                         })
 
                         if new_placement then
@@ -272,16 +310,15 @@ function module.private.update_placements(buf)
             i = i + 1
         end
     end
-    -- >>> END: YOUR INTEGRATED MANUAL PARSER FOR BLOCK MATH <<<
 
-    -- Finally, clean up any stale placements (both inline and block)
+    -- Finally, clean up any stale placements
     for node_id, p in pairs(current_placements) do
         if not active_nodes[node_id] then
             p:close()
             current_placements[node_id] = nil
         end
     end
-end
+end -- <<<<<<<<<<<<<<<< THIS WAS THE MISSING 'END'
 
 local render_timer = nil
 local function render_latex()
