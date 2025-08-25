@@ -1,3 +1,4 @@
+-- 8/25/25
 --[[
     file: Core-Latex-Renderer
     title: Rendering LaTeX with snacks.nvim
@@ -48,8 +49,7 @@ module.config.public = {
     debounce_ms = 200,
 
     -- Only render latex snippets that are longer than this many chars.
-    -- Delimiters like `$|` are not counted.
-    min_length = 3,
+    min_length = 1,
 }
 
 ---Compute and set the foreground color hex string for LaTeX rendering.
@@ -62,33 +62,28 @@ local function compute_foreground()
         module.private.foreground_hex = ("%06x"):format(hi.fg):upper()
     else
         -- Use a sensible default that works on both light and dark backgrounds.
-        -- Users can override this with the highlight group.
         module.private.foreground_hex = vim.o.background == "dark" and "FFFFFF" or "000000"
     end
 end
 
 ---Creates a full LaTeX document source from a math snippet.
 ---@param snippet string The raw math snippet from the buffer.
+---@param is_inline boolean Whether the math is inline or a block.
 ---@return string The full LaTeX source code.
-local function create_latex_source(snippet)
+local function create_latex_source(snippet, is_inline)
     local fg_hex = module.private.foreground_hex
     local content = vim.trim(snippet or "")
 
-    -- Clean the snippet from neorg's delimiters
-    content = string.gsub(content, "^%$|", "")
-    content = string.gsub(content, "|%$$", "")
-    content = string.gsub(content, "^%$", "")
-    content = string.gsub(content, "%$$", "")
-
-    -- Ensure it's in a display math environment for consistent rendering
-    if not string.find(content, "\\begin") then
-        content = ("\\[ %s \\]"):format(content)
+    if is_inline then
+        content = string.gsub(content, "^%$|", "")
+        content = string.gsub(content, "|%$$", "")
     end
 
-    -- A standard LaTeX template, inspired by snacks.nvim's own template
+    local document_class = is_inline and "standalone" or "article"
     local template = [[
-        \documentclass[preview,border=1pt,varwidth=500pt,12pt]{standalone}
+        \documentclass[preview,border=2pt]{]] .. document_class .. [[}
         \usepackage{amsmath, amssymb, amsfonts, amscd, mathtools, xcolor}
+        \pagestyle{empty}
         \begin{document}
         { \Large \selectfont
           \color[HTML]{${color}}
@@ -107,29 +102,25 @@ module.load = function()
     end
     placement = snacks_placement
 
-    -- ******* THIS IS THE FIX *******
-    -- We are overriding snacks's default PDF-to-PNG conversion to ensure a transparent background.
-    -- This is the correct way to fix the white background issue.
     local snacks_image = require("snacks.image")
     local magick_args = {
         "-density",
         module.config.public.density,
         "{src}[0]",
         "-background",
-        "none", -- The crucial flag for transparency
+        "none",
         "-trim",
     }
     snacks_image.config.convert.magick.pdf = magick_args
     snacks_image.config.convert.magick.math = magick_args
-    -- *******************************
 
     compute_foreground()
 
     module.private.cache_dir = vim.fn.stdpath("cache") .. "/neorg/latex/"
     vim.fn.mkdir(module.private.cache_dir, "p", 0755)
 
-    module.private.placements = {} ---@type table<number, table<string, any>>
-    module.private.hidden_by_cursor = {} ---@type table<number, table<string, boolean>>
+    module.private.placements = {}
+    module.private.hidden_by_cursor = {}
     module.private.do_render = module.config.public.render_on_enter
 
     module.required["core.autocommands"].enable_autocommand("BufWinEnter")
@@ -164,18 +155,13 @@ function module.private.update_placements(buf)
     local current_placements = module.private.placements[buf] or {}
     module.private.placements[buf] = current_placements
 
+    -- First, handle inline math with Treesitter for performance and accuracy
     module.required["core.integrations.treesitter"].execute_query(
         [[
-            (
-                (inline_math) @latex
-                (#offset! @latex 0 1 0 -1)
-            )
+            (inline_math) @latex.inline
+            (#offset! @latex.inline 0 1 0 -1)
         ]],
         function(query, id, node)
-            if query.captures[id] ~= "latex" then
-                return
-            end
-
             local node_id = tostring(node:id())
             active_nodes[node_id] = true
 
@@ -184,12 +170,12 @@ function module.private.update_placements(buf)
             end
 
             local snippet = module.required["core.integrations.treesitter"].get_node_text(node, buf)
-
-            if #snippet < module.config.public.min_length + 2 then
+            local check_len = #snippet + 2
+            if check_len < module.config.public.min_length then
                 return
             end
 
-            local tex_source = create_latex_source(snippet)
+            local tex_source = create_latex_source(snippet, true)
             local source_hash = vim.fn.sha256(tex_source)
             local tex_file = module.private.cache_dir .. source_hash:sub(1, 12) .. ".tex"
 
@@ -215,7 +201,80 @@ function module.private.update_placements(buf)
         buf
     )
 
-    -- Clean up placements for nodes that no longer exist
+    -- >>> START: YOUR INTEGRATED MANUAL PARSER FOR BLOCK MATH <<<
+    -- Second, handle @math blocks by manually parsing lines for robustness.
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local i = 1
+    while i <= #lines do
+        if lines[i]:match("^%s*@math%s*$") then
+            local start_line = i
+            local end_line = nil
+            for j = i + 1, #lines do
+                if lines[j]:match("^%s*@end%s*$") then
+                    end_line = j
+                    break
+                end
+            end
+
+            if not end_line then
+                i = i + 1
+            else
+                local snippet_lines = {}
+                for k = start_line + 1, end_line - 1 do
+                    table.insert(snippet_lines, lines[k])
+                end
+                local snippet = table.concat(snippet_lines, "\n")
+
+                if #snippet >= module.config.public.min_length then
+                    local block_id = ("block:%d:%d"):format(start_line, end_line)
+                    active_nodes[block_id] = true
+
+                    if not current_placements[block_id] then
+                        -- NOTE: Calling with `is_inline = false`
+                        local tex_source = create_latex_source(snippet, false)
+                        local source_hash = vim.fn.sha256(tex_source)
+                        local tex_file = module.private.cache_dir .. source_hash:sub(1, 12) .. ".tex"
+
+                        if vim.fn.filereadable(tex_file) == 0 then
+                            vim.fn.writefile(vim.split(tex_source, "\n"), tex_file)
+                        end
+
+                        -- determine the indentation of the first content line (line after @math)
+                        local content_first_line_idx = start_line + 1
+                        local indent = 0
+                        if lines[content_first_line_idx] then
+                            local leading = lines[content_first_line_idx]:match("^(%s*)") or ""
+                            indent = #leading
+                        else
+                            -- fallback: indentation of the @math line itself or zero
+                            indent = #(lines[start_line]:match("^(%s*)") or "")
+                        end
+
+                        -- Range uses 1-indexed rows and 0-indexed columns (same convention as the rest of your code)
+                        local full_range = { start_line, indent, end_line, #lines[end_line] }
+
+                        local new_placement = placement.new(buf, tex_file, {
+                            pos = { full_range[1], full_range[2] }, -- start row, start col (0-index)
+                            range = full_range,
+                            inline = true,
+                            conceal = module.config.public.conceal,
+                            type = "math",
+                        })
+
+                        if new_placement then
+                            current_placements[block_id] = new_placement
+                        end
+                    end
+                end
+                i = end_line + 1
+            end
+        else
+            i = i + 1
+        end
+    end
+    -- >>> END: YOUR INTEGRATED MANUAL PARSER FOR BLOCK MATH <<<
+
+    -- Finally, clean up any stale placements (both inline and block)
     for node_id, p in pairs(current_placements) do
         if not active_nodes[node_id] then
             p:close()
