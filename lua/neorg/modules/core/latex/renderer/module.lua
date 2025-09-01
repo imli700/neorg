@@ -80,8 +80,10 @@ local function create_latex_source(snippet, is_inline)
         end
     end
 
+    -- --- FIX 1: TIGHTENED LATEX TEMPLATE ---
+    -- Use varwidth and a 0pt border to create a tightly cropped image, matching snacks.nvim's strategy.
     local template = [[
-    \documentclass[preview,border=2pt]{%s}
+    \documentclass[preview,border=0pt,varwidth,12pt]{standalone}
     \usepackage{amsmath, amssymb, amsfonts, amscd, mathtools, xcolor}
     \pagestyle{empty}
     \begin{document}
@@ -90,7 +92,7 @@ local function create_latex_source(snippet, is_inline)
     ${content}}
     \end{document}
   ]]
-    template = template:format(is_inline and "standalone" or "article", size_cmd)
+    template = template:format(size_cmd)
 
     return template:gsub("${color}", fg_hex):gsub("${content}", content)
 end
@@ -103,45 +105,58 @@ module.load = function()
     end
     placement = snacks_placement
 
-    -- Monkey-patch to prevent inline math collapse
+    -- --- FIX 2: CONDITIONAL MONKEY-PATCH FOR INLINE COLLAPSE ---
+    -- This new patch restores snacks.nvim's logic to keep short equations on one line
+    -- with trailing text, while allowing taller equations (like fractions) to expand
+    -- vertically when space is available.
     do
-        local Placement = placement
-        if not Placement._no_inline_collapse_for_math then
-            Placement._no_inline_collapse_for_math = true
-            local util = require("snacks.image.util")
-            local orig_state = Placement.state
+        if not placement._conditional_math_collapse then
+            placement._conditional_math_collapse = true
+            local orig_state = placement.state
 
-            function Placement:state()
-                local st = orig_state(self)
-                if self.opts and self.opts.inline and self.opts.type == "math" and st.loc.height == 1 then
-                    -- Recompute without the inline collapse
-                    local width, height = vim.o.columns, vim.o.lines
-                    for _, win in ipairs(self:wins()) do
-                        width = math.min(width, vim.api.nvim_win_get_width(win))
-                        height = math.min(height, vim.api.nvim_win_get_height(win))
-                    end
-                    local size = util.fit(self.img.file, { width = width, height = height }, { info = self.img.info })
-                    st.loc.width, st.loc.height = size.width, size.height
+            -- Helper to check for text after the image range on the same line.
+            local function has_trailing_text(buf, range)
+                if not range or range[1] ~= range[3] then
+                    return false
                 end
+                local line = vim.api.nvim_buf_get_lines(buf, range[1] - 1, range[1], false)[1] or ""
+                return line:sub(range[4] + 1):find("%S") ~= nil
+            end
+
+            function placement:state()
+                local st = orig_state(self)
+
+                -- Only apply this logic to inline math images.
+                if self.opts and self.opts.inline and self.opts.type == "math" then
+                    local trailing = has_trailing_text(self.buf, self.opts.range)
+
+                    -- If there is trailing text and the math is short, collapse it to a single row
+                    -- to keep it on the same line as the text. This is snacks.nvim's heuristic.
+                    if trailing and st.loc.height <= 3 and st.loc.height > 1 then
+                        local w, h = st.loc.width, st.loc.height
+                        st.loc.width = math.ceil(w / h) + 2
+                        st.loc.height = 1
+                    end
+                    -- If there is no trailing text, the original multi-row size is kept, allowing
+                    -- fractions to render with sufficient height.
+                end
+
                 return st
             end
         end
     end
 
-    -- Pick a moderate read density
-    local read_density = 144
+    -- --- FIX 1: IMPROVED IMAGEMAGICK SETTINGS ---
+    -- Use snacks.nvim's high-density strategy for crisp, correctly-sized images.
+    local read_density = 192
     local magick_args = {
         "-density",
         read_density,
-        "{src}",
+        "{src}", -- Rasterize first page of PDF
         "-background",
-        "none",
-        "-trim",
-        "-set",
-        "units",
-        "PixelsPerInch",
-        "-density",
-        96,
+        "none", -- Use transparent background for inline math
+        "-trim", -- Remove whitespace
+        -- Do NOT reset output density. Snacks uses the high DPI to render crisply.
     }
     local snacks_image = require("snacks.image")
     snacks_image.config.convert.magick.pdf = magick_args
@@ -179,13 +194,13 @@ module.load = function()
     end)
 end
 
--- compute per-window bounds (cells)
+-- --- OPTIONAL TWEAK: Adjusted window bounds ---
+-- Slightly reduce the max height for inline math to encourage the collapse heuristic.
 local function window_bounds(inline)
     local cols = vim.api.nvim_win_get_width(0)
     local rows = vim.api.nvim_win_get_height(0)
-    -- tune these fractions to taste
     if inline then
-        return math.floor(cols * 0.85), math.max(2, math.floor(rows * 0.18))
+        return math.floor(cols * 0.85), math.max(2, math.floor(rows * 0.15))
     else
         return math.floor(cols * 0.90), math.floor(rows * 0.35)
     end
@@ -234,7 +249,6 @@ function module.private.update_placements(buf)
             local mw, mh = window_bounds(true)
             local new_placement = placement.new(buf, tex_file, {
                 pos = pos,
-                -- Corrected typo from user snippet: range[3] and range[4] instead of range + 1 and range
                 range = { range[1] + 1, range[2], range[3] + 1, range[4] },
                 inline = true,
                 conceal = module.config.public.conceal,
@@ -318,7 +332,7 @@ function module.private.update_placements(buf)
             current_placements[node_id] = nil
         end
     end
-end -- <<<<<<<<<<<<<<<< THIS WAS THE MISSING 'END'
+end
 
 local render_timer = nil
 local function render_latex()
