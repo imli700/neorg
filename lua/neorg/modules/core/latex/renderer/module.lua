@@ -74,14 +74,15 @@ local function create_latex_source(snippet, is_inline)
     if is_inline then
         content = string.gsub(content, "^%$|", "")
         content = string.gsub(content, "|%$$", "")
-        -- Force display math style for clearer fractions
+
+        -- --- FIX #1: ENSURE PROPER DISPLAY MATH ENVIRONMENT ---
+        -- Wrap content in \[ ... \] to force display math mode, mirroring snacks.nvim's
+        -- robust behavior and preventing typesetting errors.
         if not content:find("\\begin") then
-            content = "\\displaystyle " .. content
+            content = "\\[" .. content .. "\\]"
         end
     end
 
-    -- --- FIX 1: TIGHTENED LATEX TEMPLATE ---
-    -- Use varwidth and a 0pt border to create a tightly cropped image, matching snacks.nvim's strategy.
     local template = [[
     \documentclass[preview,border=0pt,varwidth,12pt]{standalone}
     \usepackage{amsmath, amssymb, amsfonts, amscd, mathtools, xcolor}
@@ -105,58 +106,26 @@ module.load = function()
     end
     placement = snacks_placement
 
-    -- --- FIX 2: CONDITIONAL MONKEY-PATCH FOR INLINE COLLAPSE ---
-    -- This new patch restores snacks.nvim's logic to keep short equations on one line
-    -- with trailing text, while allowing taller equations (like fractions) to expand
-    -- vertically when space is available.
+    -- --- FIX #2: REMOVE THE AGGRESSIVE INLINE COLLAPSE MONKEY-PATCH ---
+    -- The original patch forced multi-line fractions into a single row, causing
+    -- visual distortion. By removing it, we allow snacks.nvim's default, correct
+    -- rendering to take over.
+    -- (The empty `do ... end` block below is intentional; we are no longer patching `placement:state`)
     do
-        if not placement._conditional_math_collapse then
-            placement._conditional_math_collapse = true
-            local orig_state = placement.state
-
-            -- Helper to check for text after the image range on the same line.
-            local function has_trailing_text(buf, range)
-                if not range or range[1] ~= range[3] then
-                    return false
-                end
-                local line = vim.api.nvim_buf_get_lines(buf, range[1] - 1, range[1], false)[1] or ""
-                return line:sub(range[4] + 1):find("%S") ~= nil
-            end
-
-            function placement:state()
-                local st = orig_state(self)
-
-                -- Only apply this logic to inline math images.
-                if self.opts and self.opts.inline and self.opts.type == "math" then
-                    local trailing = has_trailing_text(self.buf, self.opts.range)
-
-                    -- If there is trailing text and the math is short, collapse it to a single row
-                    -- to keep it on the same line as the text. This is snacks.nvim's heuristic.
-                    if trailing and st.loc.height <= 3 and st.loc.height > 1 then
-                        local w, h = st.loc.width, st.loc.height
-                        st.loc.width = math.ceil(w / h) + 2
-                        st.loc.height = 1
-                    end
-                    -- If there is no trailing text, the original multi-row size is kept, allowing
-                    -- fractions to render with sufficient height.
-                end
-
-                return st
-            end
-        end
+        -- No-op: The problematic monkey-patch has been removed.
     end
 
-    -- --- FIX 1: IMPROVED IMAGEMAGICK SETTINGS ---
     -- Use snacks.nvim's high-density strategy for crisp, correctly-sized images.
     local read_density = 192
     local magick_args = {
         "-density",
         read_density,
-        "{src}", -- Rasterize first page of PDF
+        "{src}[0]", -- Rasterize first page of PDF
         "-background",
         "none", -- Use transparent background for inline math
         "-trim", -- Remove whitespace
-        -- Do NOT reset output density. Snacks uses the high DPI to render crisply.
+        "-alpha",
+        "remove",
     }
     local snacks_image = require("snacks.image")
     snacks_image.config.convert.magick.pdf = magick_args
@@ -194,15 +163,13 @@ module.load = function()
     end)
 end
 
--- --- OPTIONAL TWEAK: Adjusted window bounds ---
--- Slightly reduce the max height for inline math to encourage the collapse heuristic.
 local function window_bounds(inline)
     local cols = vim.api.nvim_win_get_width(0)
     local rows = vim.api.nvim_win_get_height(0)
     if inline then
-        return math.floor(cols * 0.85), math.max(2, math.floor(rows * 0.15))
+        return math.floor(cols * 0.85), math.floor(rows * 0.35)
     else
-        return math.floor(cols * 0.90), math.floor(rows * 0.35)
+        return math.floor(cols * 0.90), math.floor(rows * 0.50)
     end
 end
 
@@ -230,8 +197,7 @@ function module.private.update_placements(buf)
             end
 
             local snippet = module.required["core.integrations.treesitter"].get_node_text(node, buf)
-            local check_len = #snippet + 2
-            if check_len < module.config.public.min_length then
+            if #snippet < module.config.public.min_length then
                 return
             end
 
