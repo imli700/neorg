@@ -72,14 +72,17 @@ local function create_latex_source(snippet, is_inline)
         or (module.config.public.font_size_block or "\\Large")
 
     if is_inline then
-        content = string.gsub(content, "^%$|", "")
-        content = string.gsub(content, "|%$$", "")
+        -- Remove leading $| and trailing |$ exactly
+        content = content:gsub("^%$%|", "") -- strip leading "$|"
+        content = content:gsub("%|%$$", "") -- strip trailing "|$"
 
-        -- --- FIX #1: ENSURE PROPER DISPLAY MATH ENVIRONMENT ---
-        -- Wrap content in \[ ... \] to force display math mode, mirroring snacks.nvim's
-        -- robust behavior and preventing typesetting errors.
-        if not content:find("\\begin") then
-            content = "\\[" .. content .. "\\]"
+        -- If user wrote plain $ ... $ or left stray $ markers, also strip them
+        content = content:gsub("^%$", "") -- leading single $
+        content = content:gsub("%$$", "") -- trailing single $
+
+        -- If content doesn't already look like a math environment, wrap it robustly.
+        if not content:find("\\begin") and not content:match("^\\\\%(") and not content:match("^%$") then
+            content = "\\(" .. content .. "\\)"
         end
     end
 
@@ -98,6 +101,32 @@ local function create_latex_source(snippet, is_inline)
     return template:gsub("${color}", fg_hex):gsub("${content}", content)
 end
 
+-- --- NEW AND IMPROVED DEBUG WRITER ---
+-- This function ALWAYS overwrites the cached .tex file to prevent stale-cache issues.
+-- It also includes robust checks for empty content or unbalanced braces.
+local function write_tex_file_with_debug(tex_source, snippet, tex_file)
+    -- If tex_source is empty -> warn and still write for inspection
+    if not tex_source:find("%S") then
+        vim.notify("Neorg LaTeX: EMPTY tex source for snippet: " .. vim.inspect(snippet), vim.log.levels.WARN)
+    end
+
+    -- Sanity check: balanced braces
+    local opens = select(2, tex_source:gsub("{", ""))
+    local closes = select(2, tex_source:gsub("}", ""))
+    if opens ~= closes then
+        vim.notify(
+            ("Neorg LaTeX: UNBALANCED braces (%d vs %d). Writing debug tex for inspection."):format(opens, closes),
+            vim.log.levels.WARN
+        )
+        local debug_file = module.private.cache_dir .. "debug-" .. (vim.fn.strftime("%s")) .. ".tex"
+        vim.fn.writefile(vim.split(tex_source, "\n"), debug_file)
+        vim.notify("Wrote debug tex: " .. debug_file, vim.log.levels.INFO)
+    end
+
+    -- ALWAYS overwrite so we don't keep stale/malformed files
+    vim.fn.writefile(vim.split(tex_source, "\n"), tex_file)
+end
+
 module.load = function()
     local snacks_ok, snacks_placement = pcall(require, "snacks.image.placement")
     if not snacks_ok then
@@ -106,24 +135,14 @@ module.load = function()
     end
     placement = snacks_placement
 
-    -- --- FIX #2: REMOVE THE AGGRESSIVE INLINE COLLAPSE MONKEY-PATCH ---
-    -- The original patch forced multi-line fractions into a single row, causing
-    -- visual distortion. By removing it, we allow snacks.nvim's default, correct
-    -- rendering to take over.
-    -- (The empty `do ... end` block below is intentional; we are no longer patching `placement:state`)
-    do
-        -- No-op: The problematic monkey-patch has been removed.
-    end
-
-    -- Use snacks.nvim's high-density strategy for crisp, correctly-sized images.
     local read_density = 192
     local magick_args = {
         "-density",
         read_density,
-        "{src}[0]", -- Rasterize first page of PDF
+        "{src}[0]",
         "-background",
-        "none", -- Use transparent background for inline math
-        "-trim", -- Remove whitespace
+        "none",
+        "-trim",
         "-alpha",
         "remove",
     }
@@ -143,6 +162,7 @@ module.load = function()
     module.required["core.autocommands"].enable_autocommand("BufWinEnter")
     module.required["core.autocommands"].enable_autocommand("CursorMoved")
     module.required["core.autocommands"].enable_autocommand("TextChanged")
+    module.required["core.autocommands"].enable_autocommand("TextChangedI")
     module.required["core.autocommands"].enable_autocommand("InsertLeave")
     module.required["core.autocommands"].enable_autocommand("Colorscheme")
 
@@ -182,11 +202,9 @@ function module.private.update_placements(buf)
     local current_placements = module.private.placements[buf] or {}
     module.private.placements[buf] = current_placements
 
-    -- First, handle inline math with Treesitter for performance and accuracy
     module.required["core.integrations.treesitter"].execute_query(
         [[
             (inline_math) @latex.inline
-            (#offset! @latex.inline 0 1 0 -1)
         ]],
         function(query, id, node)
             local node_id = tostring(node:id())
@@ -196,7 +214,9 @@ function module.private.update_placements(buf)
                 return
             end
 
-            local snippet = module.required["core.integrations.treesitter"].get_node_text(node, buf)
+            local snippet =
+                module.required["core.integrations.treesitter"].get_node_text(node, buf, { metadata = true })
+
             if #snippet < module.config.public.min_length then
                 return
             end
@@ -205,9 +225,8 @@ function module.private.update_placements(buf)
             local source_hash = vim.fn.sha256(tex_source)
             local tex_file = module.private.cache_dir .. source_hash:sub(1, 12) .. ".tex"
 
-            if vim.fn.filereadable(tex_file) == 0 then
-                vim.fn.writefile(vim.split(tex_source, "\n"), tex_file)
-            end
+            -- Use the new debug-aware writer function that always overwrites
+            write_tex_file_with_debug(tex_source, snippet, tex_file)
 
             local range = { node:range() }
             local pos = { range[1] + 1, range[2] }
@@ -230,7 +249,7 @@ function module.private.update_placements(buf)
         buf
     )
 
-    -- Second, handle @math blocks by manually parsing lines for robustness.
+    -- Handle @math blocks
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     local i = 1
     while i <= #lines do
@@ -262,9 +281,8 @@ function module.private.update_placements(buf)
                         local source_hash = vim.fn.sha256(tex_source)
                         local tex_file = module.private.cache_dir .. source_hash:sub(1, 12) .. ".tex"
 
-                        if vim.fn.filereadable(tex_file) == 0 then
-                            vim.fn.writefile(vim.split(tex_source, "\n"), tex_file)
-                        end
+                        -- Use the new debug-aware writer function that always overwrites
+                        write_tex_file_with_debug(tex_source, snippet, tex_file)
 
                         local full_range = { start_line + 1, 0, end_line + 1, #lines[end_line] }
 
@@ -291,7 +309,7 @@ function module.private.update_placements(buf)
         end
     end
 
-    -- Finally, clean up any stale placements
+    -- Clean up stale placements
     for node_id, p in pairs(current_placements) do
         if not active_nodes[node_id] then
             p:close()
@@ -363,7 +381,9 @@ local function show_all_placements(buf)
             p:show()
         end
     end
-    module.private.hidden_by_cursor[buf] = {}
+    if module.private.hidden_by_cursor[buf] then
+        module.private.hidden_by_cursor[buf] = {}
+    end
 end
 
 local function disable_rendering()
@@ -418,6 +438,7 @@ local event_handlers = {
     end,
     ["core.autocommands.events.cursormoved"] = clear_at_cursor,
     ["core.autocommands.events.textchanged"] = render_latex,
+    ["core.autocommands.events.textchangedi"] = render_latex,
     ["core.autocommands.events.insertleave"] = render_latex,
     ["core.autocommands.events.colorscheme"] = colorscheme_change,
 }
@@ -444,6 +465,7 @@ module.events.subscribed = {
         bufwinenter = true,
         cursormoved = true,
         textchanged = true,
+        textchangedi = true,
         insertleave = true,
         colorscheme = true,
     },
